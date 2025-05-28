@@ -1,0 +1,11 @@
+/build/
+/debug/
+/CMakeFiles/
+/CMakeCache.txt
+/*.exe
+/*.out
+/*.obj
+/*.o
+.vscode/
+*.log
+*.tmp
