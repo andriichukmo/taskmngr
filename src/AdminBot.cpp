@@ -2,10 +2,14 @@
 #include "config.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <curl/curl.h>
 #include <curl/easy.h>
+#include <exception>
 #include <iostream>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -29,26 +33,49 @@ AdminBot::AdminBot(const std::string &token, const std::string &password,
 static void curlCleanup() { curl_global_cleanup(); }
 
 void AdminBot::run() {
-  while (true) {
-    try {
-      std::ostringstream param;
-      param << "offset=" << (last_update_id_ + 1) << "&timeout=2";
-      auto resp = apiGet("getUpdates", param.str());
-      auto j = json::parse(resp);
-      for (auto &upd : j["result"]) {
-        last_update_id_ = upd["update_id"].get<int>();
-        if (!upd.contains("message"))
-          continue;
-        auto &msg = upd["message"];
-        int64_t chat_id = msg["chat"]["id"].get<int64_t>();
-        std::string text = msg["text"].get<std::string>();
-        processMessage(chat_id, text);
+  std::queue<json> q;
+  std::mutex mtx;
+  std::condition_variable cv;
+  bool stop = false;
+
+  std::thread poller([&]() {
+    while (!stop) {
+      try {
+        std::ostringstream param;
+        param << "offset=" << (last_update_id_ + 1) << "&timeout=0";
+        std::string resp = apiGet("getUpdates", param.str());
+        auto j = json::parse(resp);
+        {
+          std::lock_guard<std::mutex> lk(mtx);
+          for (auto &upd : j["result"]) {
+            q.push(upd);
+          }
+        }
+        cv.notify_one();
+      } catch (std::exception &e) {
+        std::cerr << "Poller error: " << e.what() << std::endl;
       }
-    } catch (std::exception &e) {
-      std::cerr << "AdminBot error : " << e.what() << std::endl;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+  while (true) {
+    json upd;
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      cv.wait(lk, [&] { return !q.empty(); });
+      upd = q.front();
+      q.pop();
+    }
+    last_update_id_ = upd["update_id"].get<int>();
+    if (upd.contains("message")) {
+      auto &msg = upd["message"];
+      int64_t chat = msg["chat"]["id"].get<int64_t>();
+      std::string text = msg["text"].get<std::string>();
+      processMessage(chat, text);
     }
   }
-  curlCleanup();
+  stop = true;
+  poller.join();
 }
 
 void AdminBot::processMessage(int64_t chat_id, const std::string &text) {
@@ -99,11 +126,8 @@ std::string AdminBot::apiGet(const std::string &method,
   curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuf);
-  CURLcode res = curl_easy_perform(curl);
+  curl_easy_perform(curl);
   curl_easy_cleanup(curl);
-  if (res != CURLE_OK) {
-    throw std::runtime_error("CURL GET FAILED");
-  }
   return readBuf;
 }
 
